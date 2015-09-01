@@ -408,6 +408,262 @@ function Base.push!(p::Plot, element::ElementOrFunctionOrLayers)
     return p
 end
 
+function _process_layers(plot::Plot)
+    # Process layers, filling inheriting mappings or data from the Plot where
+    # they are missing.
+    datas = Array(Data, length(plot.layers))
+    for (i, layer) in enumerate(plot.layers)
+        if layer.data_source === nothing && isempty(layer.mapping)
+            layer.data_source = plot.data_source
+            layer.mapping = plot.mapping
+            datas[i] = plot.data
+        else
+            datas[i] = Data()
+
+            if layer.data_source === nothing
+                layer.data_source = plot.data_source
+            end
+
+            if isempty(layer.mapping)
+                layer.mapping = plot.mapping
+            end
+
+            for (k, v) in layer.mapping
+                set_mapped_data!(datas[i], layer.data_source, k, v)
+            end
+        end
+    end
+
+    datas
+end
+
+function _process_subplot_data(plot::Plot, datas::Vector{Data})
+    subplot_datas = Data[]
+    for (layer, layer_data) in zip(plot.layers, datas)
+        if isa(layer.geom, Geom.SubplotGeometry)
+            for subplot_layer in layers(layer.geom)
+                subplot_data = Data()
+                if subplot_layer.data_source === nothing
+                    subplot_layer.data_source = layer.data_source
+                end
+
+                if isempty(subplot_layer.mapping)
+                    subplot_layer.mapping = layer.mapping
+                end
+
+                for (k, v) in subplot_layer.mapping
+                    set_mapped_data!(subplot_data, subplot_layer.data_source, k, v)
+                end
+                push!(subplot_datas, subplot_data)
+            end
+        end
+    end
+    subplot_datas
+end
+
+function _process_coordinates!(plot::Plot)
+    # Figure out the coordinates
+    coord = plot.coord
+    for layer in plot.layers
+        coord_type = element_coordinate_type(layer.geom)
+        if coord === nothing
+            coord = coord_type()
+        elseif typeof(coord) != coord_type
+            error("Plot uses multiple coordinates: $(typeof(coord)) and $(coord_type)")
+        end
+    end
+    coord
+end
+
+function _add_default_stats(plot::Plot)
+    # Add default statistics for geometries.
+    layer_stats = Array(StatisticElement, length(plot.layers))
+    for (i, layer) in enumerate(plot.layers)
+        layer_stats[i] = typeof(layer.statistic) == Stat.nil ?
+            default_statistic(layer.geom) : layer.statistic
+    end
+    layer_stats
+end
+
+function _determine_aesthetics(plot::Plot,
+                               layer_stats::Vector{StatisticElement})
+
+    used_aesthetics = Set{Symbol}()
+    for layer in plot.layers
+        union!(used_aesthetics, element_aesthetics(layer.geom))
+    end
+
+    for stat in layer_stats
+        union!(used_aesthetics, element_aesthetics(stat))
+    end
+
+    mapped_aesthetics = Set(keys(plot.mapping))
+    for layer in plot.layers
+        union!(mapped_aesthetics, keys(layer.mapping))
+    end
+
+    defined_unused_aesthetics = setdiff(mapped_aesthetics, used_aesthetics)
+    if !isempty(defined_unused_aesthetics)
+        warn("The following aesthetics are mapped, but not used by any geometry:\n    ",
+             join([string(a) for a in defined_unused_aesthetics], ", "))
+    end
+
+    scaled_aesthetics = Set{Symbol}()
+    for scale in plot.scales
+        union!(scaled_aesthetics, element_aesthetics(scale))
+    end
+
+    return (used_aesthetics, mapped_aesthetics, defined_unused_aesthetics,
+            scaled_aesthetics)
+end
+
+function _extract_scales(plot::Plot)
+    scales = Dict{Symbol, ScaleElement}()
+    for scale in plot.scales
+        for var in element_aesthetics(scale)
+            scales[var] = scale
+        end
+    end
+    scales
+end
+
+function _add_default_scales!(plot::Plot, layer_stats::Vector{StatisticElement},
+                              unscaled_aesthetics::Set,
+                              scales::Dict{Symbol, ScaleElement})
+    # Add default scales for statistics.
+    for element in chain(plot.statistics, layer_stats, [l.geom for l in plot.layers])
+      for scale in default_scales(element)
+          # Use the statistics default scale only when it covers some
+          # aesthetic that is not already scaled.
+          scale_aes = Set(element_aesthetics(scale))
+          if !isempty(intersect(scale_aes, unscaled_aesthetics))
+              for var in scale_aes
+                  scales[var] = scale
+              end
+              setdiff!(unscaled_aesthetics, scale_aes)
+          end
+      end
+    end
+    scales
+end
+
+function _assign_scales_aes!(plot::Plot, unscaled_aesthetics::Set,
+                             mapped_aesthetics::Set, datas::Vector{Data},
+                             scales::Dict{Symbol, ScaleElement})
+    # Assign scales to mapped aesthetics first.
+    for var in unscaled_aesthetics
+        if !in(var, mapped_aesthetics)
+            continue
+        end
+
+        var_data = getfield(plot.data, var)
+        if var_data == nothing
+            for data in datas
+                var_layer_data = getfield(data, var)
+                if var_layer_data != nothing
+                    var_data = var_layer_data
+                    break
+                end
+            end
+        end
+
+        if var_data == nothing
+            continue
+        end
+
+        t = classify_data(var_data)
+        if t == nothing
+
+        end
+
+        if haskey(default_aes_scales[t], var)
+            scale = default_aes_scales[t][var]
+            scale_aes = Set(element_aesthetics(scale))
+            for var in scale_aes
+                scales[var] = scale
+            end
+        end
+    end
+end
+
+function _assign_categorical_scales!(plot::Plot, scales::Dict{Symbol, ScaleElement},
+                                     unscaled_aesthetics::Set,
+                                     datas::Vector{Data},
+                                     subplot_datas::Vector{Data})
+    for var in unscaled_aesthetics
+        if haskey(plot.mapping, var) || haskey(scales, var)
+            continue
+        end
+
+        t = :categorical
+        for data in chain(datas, subplot_datas)
+            val = getfield(data, var)
+            if val != nothing && val != :categorical
+               t = classify_data(val)
+           end
+       end
+
+       if haskey(default_aes_scales[t], var)
+           scale = default_aes_scales[t][var]
+           scale_aes = Set(element_aesthetics(scale))
+           for var in scale_aes
+               scales[var] = scale
+           end
+       end
+    end
+end
+
+function _dont_clobber_guides(plot::Plot)
+    # Avoid clobbering user-defined guides with default guides (e.g.
+    # in the case of labels.)
+    guides = copy(plot.guides)
+    explicit_guide_types = Set()
+    for guide in guides
+        push!(explicit_guide_types, typeof(guide))
+    end
+    guides, explicit_guide_types
+end
+
+function _gather_stats(plot::Plot)
+    statistics = Set{StatisticElement}()
+    for statistic in plot.statistics
+        push!(statistics, statistic)
+    end
+    statistics
+end
+
+function _should_do_facet(plot::Plot)
+    # Default guides and statistics
+    facet_plot = true
+    for layer in plot.layers
+        if typeof(layer.geom) != Geom.subplot_grid
+            facet_plot = false
+            break
+        end
+    end
+    facet_plot
+end
+
+function _add_default_guides_no_facet!(guides::Vector{GuideElement},
+                                       explicit_guide_types::Set)
+    if !in(Guide.PanelBackground, explicit_guide_types)
+        push!(guides, Guide.background())
+    end
+
+    if !in(Guide.ZoomSlider, explicit_guide_types)
+        push!(guides, Guide.zoomslider())
+    end
+
+    if !in(Guide.XTicks, explicit_guide_types)
+        push!(guides, Guide.xticks())
+    end
+
+    if !in(Guide.YTicks, explicit_guide_types)
+        push!(guides, Guide.yticks())
+    end
+end
+
+
 
 # Turn a graph specification into a graphic.
 #
@@ -452,217 +708,51 @@ function render(plot::Plot)
 
     # Process layers, filling inheriting mappings or data from the Plot where
     # they are missing.
-    datas = Array(Data, length(plot.layers))
-    for (i, layer) in enumerate(plot.layers)
-        if layer.data_source === nothing && isempty(layer.mapping)
-            layer.data_source = plot.data_source
-            layer.mapping = plot.mapping
-            datas[i] = plot.data
-        else
-            datas[i] = Data()
-
-            if layer.data_source === nothing
-                layer.data_source = plot.data_source
-            end
-
-            if isempty(layer.mapping)
-                layer.mapping = plot.mapping
-            end
-
-            for (k, v) in layer.mapping
-                set_mapped_data!(datas[i], layer.data_source, k, v)
-            end
-        end
-    end
+    datas = _process_layers(plot)::Vector{Data}
 
     # We need to process subplot layers somewhat as though they were regular
     # plot layers. This is the only way scales, etc, can be consistently
     # applied.
-    subplot_datas = Data[]
-    for (layer, layer_data) in zip(plot.layers, datas)
-        if isa(layer.geom, Geom.SubplotGeometry)
-            for subplot_layer in layers(layer.geom)
-                subplot_data = Data()
-                if subplot_layer.data_source === nothing
-                    subplot_layer.data_source = layer.data_source
-                end
-
-                if isempty(subplot_layer.mapping)
-                    subplot_layer.mapping = layer.mapping
-                end
-
-                for (k, v) in subplot_layer.mapping
-                    set_mapped_data!(subplot_data, subplot_layer.data_source, k, v)
-                end
-                push!(subplot_datas, subplot_data)
-            end
-        end
-    end
+    subplot_datas = _process_subplot_data(plot, datas)::Vector{Data}
 
     # Figure out the coordinates
-    coord = plot.coord
-    for layer in plot.layers
-        coord_type = element_coordinate_type(layer.geom)
-        if coord === nothing
-            coord = coord_type()
-        elseif typeof(coord) != coord_type
-            error("Plot uses multiple coordinates: $(typeof(coord)) and $(coord_type)")
-        end
-    end
+    coord = _process_coordinates!(plot)
 
     # Add default statistics for geometries.
-    layer_stats = Array(StatisticElement, length(plot.layers))
-    for (i, layer) in enumerate(plot.layers)
-        layer_stats[i] = typeof(layer.statistic) == Stat.nil ?
-            default_statistic(layer.geom) : layer.statistic
-    end
+    layer_stats = _add_default_stats(plot)
 
-    used_aesthetics = Set{Symbol}()
-    for layer in plot.layers
-        union!(used_aesthetics, element_aesthetics(layer.geom))
-    end
-
-    for stat in layer_stats
-        union!(used_aesthetics, element_aesthetics(stat))
-    end
-
-    mapped_aesthetics = Set(keys(plot.mapping))
-    for layer in plot.layers
-        union!(mapped_aesthetics, keys(layer.mapping))
-    end
-
-    defined_unused_aesthetics = setdiff(mapped_aesthetics, used_aesthetics)
-    if !isempty(defined_unused_aesthetics)
-        warn("The following aesthetics are mapped, but not used by any geometry:\n    ",
-             join([string(a) for a in defined_unused_aesthetics], ", "))
-    end
-
-    scaled_aesthetics = Set{Symbol}()
-    for scale in plot.scales
-        union!(scaled_aesthetics, element_aesthetics(scale))
-    end
+    (used_aesthetics,
+     mapped_aesthetics,
+     defined_unused_aesthetics,
+     scaled_aesthetics) = _determine_aesthetics(plot, layer_stats)
 
     # Only one scale can be applied to an aesthetic (without getting some weird
     # and incorrect results), so we organize scales into a dict.
-    scales = Dict{Symbol, ScaleElement}()
-    for scale in plot.scales
-        for var in element_aesthetics(scale)
-            scales[var] = scale
-        end
-    end
+    scales = _extract_scales(plot)
 
     unscaled_aesthetics = setdiff(used_aesthetics, scaled_aesthetics)
 
     # Add default scales for statistics.
-    for element in chain(plot.statistics, layer_stats, [l.geom for l in plot.layers])
-        for scale in default_scales(element)
-            # Use the statistics default scale only when it covers some
-            # aesthetic that is not already scaled.
-            scale_aes = Set(element_aesthetics(scale))
-            if !isempty(intersect(scale_aes, unscaled_aesthetics))
-                for var in scale_aes
-                    scales[var] = scale
-                end
-                setdiff!(unscaled_aesthetics, scale_aes)
-            end
-        end
-    end
+    _add_default_scales!(plot, layer_stats, unscaled_aesthetics, scales)
 
     # Assign scales to mapped aesthetics first.
-    for var in unscaled_aesthetics
-        if !in(var, mapped_aesthetics)
-            continue
-        end
+    _assign_scales_aes!(plot, unscaled_aesthetics, mapped_aesthetics, datas,
+                        scales)
 
-        var_data = getfield(plot.data, var)
-        if var_data == nothing
-            for data in datas
-                var_layer_data = getfield(data, var)
-                if var_layer_data != nothing
-                    var_data = var_layer_data
-                    break
-                end
-            end
-        end
-
-        if var_data == nothing
-            continue
-        end
-
-        t = classify_data(var_data)
-        if t == nothing
-
-        end
-
-        if haskey(default_aes_scales[t], var)
-            scale = default_aes_scales[t][var]
-            scale_aes = Set(element_aesthetics(scale))
-            for var in scale_aes
-                scales[var] = scale
-            end
-        end
-    end
-
-    for var in unscaled_aesthetics
-        if haskey(plot.mapping, var) || haskey(scales, var)
-            continue
-        end
-
-        t = :categorical
-        for data in chain(datas, subplot_datas)
-            val = getfield(data, var)
-            if val != nothing && val != :categorical
-                t = classify_data(val)
-            end
-        end
-
-        if haskey(default_aes_scales[t], var)
-            scale = default_aes_scales[t][var]
-            scale_aes = Set(element_aesthetics(scale))
-            for var in scale_aes
-                scales[var] = scale
-            end
-        end
-    end
+    _assign_categorical_scales!(plot, scales, unscaled_aesthetics, datas,
+                                subplot_datas)
 
     # Avoid clobbering user-defined guides with default guides (e.g.
     # in the case of labels.)
-    guides = copy(plot.guides)
-    explicit_guide_types = Set()
-    for guide in guides
-        push!(explicit_guide_types, typeof(guide))
-    end
+    guides, explicit_guide_types = _dont_clobber_guides(plot)
 
-    statistics = Set{StatisticElement}()
-    for statistic in plot.statistics
-        push!(statistics, statistic)
-    end
+    statistics = _gather_stats(plot)
 
     # Default guides and statistics
-    facet_plot = true
-    for layer in plot.layers
-        if typeof(layer.geom) != Geom.subplot_grid
-            facet_plot = false
-            break
-        end
-    end
+    facet_plot = _should_do_facet(plot)
 
     if !facet_plot
-        if !in(Guide.PanelBackground, explicit_guide_types)
-            push!(guides, Guide.background())
-        end
-
-        if !in(Guide.ZoomSlider, explicit_guide_types)
-            push!(guides, Guide.zoomslider())
-        end
-
-        if !in(Guide.XTicks, explicit_guide_types)
-            push!(guides, Guide.xticks())
-        end
-
-        if !in(Guide.YTicks, explicit_guide_types)
-            push!(guides, Guide.yticks())
-        end
+        _add_default_guides_no_facet!(guides, explicit_guide_types)
     end
 
     for guide in guides
