@@ -1155,4 +1155,16 @@ function render(guide::Annotation, theme::Gadfly.Theme,
 end
 
 
+# precompile
+Base.precompile(render, (PanelBackground, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (ZoomSlider, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (ColorKey, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (ManualColorKey, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (XTicks, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (YTicks, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (XLabel, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (YLabel, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (Title, Gadfly.Theme, Gadfly.Aesthetics))
+Base.precompile(render, (Annotation, Gadfly.Theme, Gadfly.Aesthetics))
+
 end # module Guide
