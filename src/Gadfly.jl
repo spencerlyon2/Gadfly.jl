@@ -408,6 +408,10 @@ function Base.push!(p::Plot, element::ElementOrFunctionOrLayers)
     return p
 end
 
+# TODO: CoordinateElement is abstract
+# TODO: StatisticElement is abstract
+# TODO: GuideElement is abstract
+# TODO: ScaleElement is abstract
 function _process_layers(plot::Plot)
     # Process layers, filling inheriting mappings or data from the Plot where
     # they are missing.
@@ -528,7 +532,7 @@ function _extract_scales(plot::Plot)
 end
 
 function _add_default_scales!(plot::Plot, layer_stats::Vector{StatisticElement},
-                              unscaled_aesthetics::Set,
+                              unscaled_aesthetics::Set{Symbol},
                               scales::Dict{Symbol, ScaleElement})
     # Add default scales for statistics.
     for element in chain(plot.statistics, layer_stats, [l.geom for l in plot.layers])
@@ -547,9 +551,10 @@ function _add_default_scales!(plot::Plot, layer_stats::Vector{StatisticElement},
     scales
 end
 
-function _assign_scales_aes!(plot::Plot, unscaled_aesthetics::Set,
-                             mapped_aesthetics::Set, datas::Vector{Data},
-                             scales::Dict{Symbol, ScaleElement})
+function _assign_scales_aes!(plot::Plot, unscaled_aesthetics::Set{Symbol},
+                             mapped_aesthetics::Set{Symbol},
+                             datas::Vector{Data},
+                             scales::Dict{Symbol,ScaleElement})
     # Assign scales to mapped aesthetics first.
     for var in unscaled_aesthetics
         if !in(var, mapped_aesthetics)
@@ -587,7 +592,7 @@ function _assign_scales_aes!(plot::Plot, unscaled_aesthetics::Set,
 end
 
 function _assign_categorical_scales!(plot::Plot, scales::Dict{Symbol, ScaleElement},
-                                     unscaled_aesthetics::Set,
+                                     unscaled_aesthetics::Set{Symbol},
                                      datas::Vector{Data},
                                      subplot_datas::Vector{Data})
     for var in unscaled_aesthetics
@@ -617,7 +622,7 @@ function _dont_clobber_guides(plot::Plot)
     # Avoid clobbering user-defined guides with default guides (e.g.
     # in the case of labels.)
     guides = copy(plot.guides)
-    explicit_guide_types = Set()
+    explicit_guide_types = Set{DataType}()
     for guide in guides
         push!(explicit_guide_types, typeof(guide))
     end
@@ -645,7 +650,7 @@ function _should_do_facet(plot::Plot)
 end
 
 function _add_default_guides_no_facet!(guides::Vector{GuideElement},
-                                       explicit_guide_types::Set)
+                                       explicit_guide_types::Set{DataType})
     if !in(Guide.PanelBackground, explicit_guide_types)
         push!(guides, Guide.background())
     end
@@ -663,6 +668,133 @@ function _add_default_guides_no_facet!(guides::Vector{GuideElement},
     end
 end
 
+function _add_guide_stats!(statistics, guides)
+    for guide in guides
+        push!(statistics, default_statistic(guide))
+    end
+end
+
+function _manage_xy_labels!(plot::Plot, datas::Vector{Data},
+                            mapped_aesthetics::Set{Symbol},
+                            used_aesthetics::Set{Symbol},
+                            explicit_guide_types::Set{DataType},
+                            facet_plot::Bool, guides::Vector{GuideElement})
+
+    function choose_name(vs::Vector{Symbol}, fallback::ASCIIString)
+        for v in vs
+            if haskey(plot.data.titles, v)
+                return plot.data.titles[v]
+            end
+        end
+
+        for v in vs
+            for data in datas
+                if haskey(data.titles, v)
+                    return data.titles[v]
+                end
+            end
+        end
+
+        fallback
+    end
+
+    function mapped_and_used(vs::Vector{Symbol})
+        any([in(v, mapped_aesthetics) && in(v, used_aesthetics) for v in vs])
+    end
+
+    if mapped_and_used(x_axis_label_aesthetics) &&
+        !in(Guide.XLabel, explicit_guide_types)
+        label = choose_name(x_axis_label_aesthetics, "x")
+        if facet_plot && haskey(plot.data.titles, :xgroup)
+            label = string(label, " <i><b>by</b></i> ", plot.data.titles[:xgroup])
+            end
+        push!(guides, Guide.xlabel(label))
+        end
+
+    if mapped_and_used(y_axis_label_aesthetics) &&
+    !in(Guide.YLabel, explicit_guide_types)
+        label = choose_name(y_axis_label_aesthetics, "y")
+        if facet_plot && haskey(plot.data.titles, :ygroup)
+            label = string(label, " <i><b>by</b></i> ", plot.data.titles[:ygroup])
+            end
+        push!(guides, Guide.ylabel(label))
+    end
+end
+
+function _set_default_labels!(plot::Plot, layer_aess::Vector{Aesthetics})
+    # set default labels
+    for (i, layer) in enumerate(plot.layers)
+        if layer_aess[i].color_key_title == nothing &&
+           haskey(layer.mapping, :color) &&
+           !isa(layer.mapping[:color], AbstractArray)
+           layer_aess[i].color_key_title = string(layer.mapping[:color])
+       end
+    end
+
+    if layer_aess[1].color_key_title == nothing &&
+       haskey(plot.mapping, :color) && !isa(plot.mapping[:color], AbstractArray)
+        layer_aess[1].color_key_title = string(plot.mapping[:color])
+    end
+end
+
+function _apply_stats!(layer_stats::Vector{StatisticElement},
+                       layer_aess::Vector{Aesthetics},
+                       scales::Dict{Symbol, ScaleElement},
+                       coord::Gadfly.CoordinateElement,
+                       statistics::Set{StatisticElement})
+    # IIa. Layer-wise statistics
+    for (layer_stat, aes) in zip(layer_stats, layer_aess)
+        Stat.apply_statistics(StatisticElement[layer_stat], scales, coord, aes)
+    end
+
+    # IIb. Plot-wise Statistics
+    plot_aes = concat(layer_aess...)
+    statistics = collect(statistics)
+    Stat.apply_statistics(statistics, scales, coord, plot_aes)
+    plot_aes
+end
+
+function _maybe_supress_colors(plot::Plot, plot_aes::Aesthetics,
+                               layer_aess::Vector{Aesthetics},
+                               explicit_guide_types::Set{DataType},
+                               guides::Vector{GuideElement})
+    # Add some default guides determined by defined aesthetics
+    supress_colorkey = false
+    for layer in plot.layers
+       if isa(layer.geom, Geom.SubplotGeometry) &&
+               haskey(layer.geom.guides, Guide.ColorKey)
+           supress_colorkey = true
+           break
+       end
+    end
+
+    if !supress_colorkey &&
+      !all([aes.color === nothing for aes in [plot_aes, layer_aess...]]) &&
+      !in(Guide.ColorKey, explicit_guide_types) &&
+      !in(Guide.ManualColorKey, explicit_guide_types)
+       push!(guides, Guide.colorkey())
+    end
+end
+
+function _build_scaled_aes(plot::Plot, layer_aess::Vector{Aesthetics},
+                           subplot_datas::Vector{Data})
+    # build arrays of scaled aesthetics for layers within subplots
+    layer_subplot_aess = Array(Vector{Aesthetics}, length(plot.layers))
+    layer_subplot_datas = Array(Vector{Data}, length(plot.layers))
+    j = 1
+    for (i, layer) in enumerate(plot.layers)
+        layer_subplot_aess[i] = Aesthetics[]
+        layer_subplot_datas[i] = Data[]
+        if isa(layer.geom, Geom.SubplotGeometry)
+            for subplot_layer in layers(layer.geom)
+                push!(layer_subplot_aess[i], layer_aess[length(datas) + j])
+                push!(layer_subplot_datas[i], subplot_datas[j])
+                j += 1
+            end
+        end
+    end
+    layer_subplot_aess, layer_subplot_datas
+end
 
 
 # Turn a graph specification into a graphic.
@@ -726,6 +858,7 @@ function render(plot::Plot)
      defined_unused_aesthetics,
      scaled_aesthetics) = _determine_aesthetics(plot, layer_stats)
 
+
     # Only one scale can be applied to an aesthetic (without getting some weird
     # and incorrect results), so we organize scales into a dict.
     scales = _extract_scales(plot)
@@ -755,112 +888,29 @@ function render(plot::Plot)
         _add_default_guides_no_facet!(guides, explicit_guide_types)
     end
 
-    for guide in guides
-        push!(statistics, default_statistic(guide))
-    end
+    _add_guide_stats!(statistics, guides)
 
-    function mapped_and_used(vs)
-        any([in(v, mapped_aesthetics) && in(v, used_aesthetics) for v in vs])
-    end
-
-    function choose_name(vs, fallback)
-        for v in vs
-            if haskey(plot.data.titles, v)
-                return plot.data.titles[v]
-            end
-        end
-
-        for v in vs
-            for data in datas
-                if haskey(data.titles, v)
-                    return data.titles[v]
-                end
-            end
-        end
-
-        fallback
-    end
-
-    if mapped_and_used(x_axis_label_aesthetics) &&
-        !in(Guide.XLabel, explicit_guide_types)
-        label = choose_name(x_axis_label_aesthetics, "x")
-        if facet_plot && haskey(plot.data.titles, :xgroup)
-            label = string(label, " <i><b>by</b></i> ", plot.data.titles[:xgroup])
-        end
-
-        push!(guides, Guide.xlabel(label))
-    end
-
-    if mapped_and_used(y_axis_label_aesthetics) &&
-       !in(Guide.YLabel, explicit_guide_types)
-        label = choose_name(y_axis_label_aesthetics, "y")
-        if facet_plot && haskey(plot.data.titles, :ygroup)
-            label = string(label, " <i><b>by</b></i> ", plot.data.titles[:ygroup])
-        end
-
-        push!(guides, Guide.ylabel(label))
-    end
+    _manage_xy_labels!(plot, datas, mapped_aesthetics, used_aesthetics,
+                       explicit_guide_types, facet_plot, guides)
 
     # I. Scales
     layer_aess = Scale.apply_scales(Iterators.distinct(values(scales)),
                                     datas..., subplot_datas...)
 
-    # set default labels
-    for (i, layer) in enumerate(plot.layers)
-        if layer_aess[i].color_key_title == nothing &&
-           haskey(layer.mapping, :color) &&
-           !isa(layer.mapping[:color], AbstractArray)
-           layer_aess[i].color_key_title = string(layer.mapping[:color])
-       end
-    end
+    _set_default_labels!(plot, layer_aess)
 
-    if layer_aess[1].color_key_title == nothing &&
-       haskey(plot.mapping, :color) && !isa(plot.mapping[:color], AbstractArray)
-        layer_aess[1].color_key_title = string(plot.mapping[:color])
-    end
-
-    # IIa. Layer-wise statistics
-    for (layer_stat, aes) in zip(layer_stats, layer_aess)
-        Stat.apply_statistics(StatisticElement[layer_stat], scales, coord, aes)
-    end
-
-    # IIb. Plot-wise Statistics
-    plot_aes = concat(layer_aess...)
-    statistics = collect(statistics)
-    Stat.apply_statistics(statistics, scales, coord, plot_aes)
+    # apply all stats, both to layers and entire plot
+    plot_aes = _apply_stats!(layer_stats, layer_aess, scales, coord,
+                             statistics)
 
     # Add some default guides determined by defined aesthetics
-    supress_colorkey = false
-    for layer in plot.layers
-        if isa(layer.geom, Geom.SubplotGeometry) &&
-                haskey(layer.geom.guides, Guide.ColorKey)
-            supress_colorkey = true
-            break
-        end
-    end
-
-    if !supress_colorkey &&
-       !all([aes.color === nothing for aes in [plot_aes, layer_aess...]]) &&
-       !in(Guide.ColorKey, explicit_guide_types) &&
-       !in(Guide.ManualColorKey, explicit_guide_types)
-        push!(guides, Guide.colorkey())
-    end
+    _maybe_supress_colors(plot, plot_aes, layer_aess, explicit_guide_types,
+                          guides)
 
     # build arrays of scaled aesthetics for layers within subplots
-    layer_subplot_aess = Array(Vector{Aesthetics}, length(plot.layers))
-    layer_subplot_datas = Array(Vector{Data}, length(plot.layers))
-    j = 1
-    for (i, layer) in enumerate(plot.layers)
-        layer_subplot_aess[i] = Aesthetics[]
-        layer_subplot_datas[i] = Data[]
-        if isa(layer.geom, Geom.SubplotGeometry)
-            for subplot_layer in layers(layer.geom)
-                push!(layer_subplot_aess[i], layer_aess[length(datas) + j])
-                push!(layer_subplot_datas[i], subplot_datas[j])
-                j += 1
-            end
-        end
-    end
+    layer_subplot_aess, layer_subplot_datas = _build_scaled_aes(plot,
+                                                                layer_aess,
+                                                                subplot_datas)
 
     root_context = render_prepared(plot, coord, plot_aes, layer_aess,
                                    layer_stats, layer_subplot_aess,
